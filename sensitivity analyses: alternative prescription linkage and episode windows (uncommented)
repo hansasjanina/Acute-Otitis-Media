@@ -1,0 +1,592 @@
+res<-read_parquet(paste0("/media/volume/JaninaH/","fidien_kaikki_reseptit.parquet"))
+#additional windows tested first 0 days
+same_day <- cdf1 %>%
+  left_join(res, by =c("FID", "PVM"="DATE_PK"))
+#1169854 rows
+same_day<-read_parquet(paste0("/media/volume/JaninaH/","reseptien_yhdistys_sama_pv.parquet"))
+
+#one week
+
+candidates <- res %>%
+  inner_join(cdf1, by = "FID") %>%
+  filter(DATE_PK >= PVM & DATE_PK <= PVM + days(7)) %>%
+  mutate(pvm_diff = as.numeric(DATE_PK - PVM))
+#remove colums to avoid duplicates
+candidates<-subset(candidates, select = c(1:6, 9, 18))
+# Only one visit per recept but keep all recepts per visit
+best_matches <- candidates %>%
+  arrange(FID, DATE_PK, pvm_diff) %>%
+  group_by(FID, DATE_PK, row_id = row_number()) %>%  # säilytetään kaikki reseptit
+  slice(1) %>%  # mutta yhdistetään resepti vain yhteen käyntiin
+  ungroup()
+
+#Combine recepts with visit-data
+one_week <- cdf1 %>%
+  left_join(best_matches, by = c("FID", "PVM"))   
+#1295402 rows
+one_week<-read_parquet(paste0("/media/volume/JaninaH/","reseptien_yhdistys_viikko.parquet"))
+#---------our slected window 2 days
+#All possible combinations where DATE_PK is PVM or 1–2 days after
+candidates <- res %>%
+  inner_join(cdf1, by = "FID") %>%
+  filter(DATE_PK >= PVM & DATE_PK <= PVM + days(2)) %>%
+  mutate(pvm_diff = as.numeric(DATE_PK - PVM))
+#remove colums to avoid duplicates
+candidates<-subset(candidates, select = c(1:6, 9, 18))
+# Only one visit per recept but keep all recepts per visit
+best_matches <- candidates %>%
+  arrange(FID, DATE_PK, pvm_diff) %>%
+  group_by(FID, DATE_PK, row_id = row_number()) %>%  # säilytetään kaikki reseptit
+  slice(1) %>%  # mutta yhdistetään resepti vain yhteen käyntiin
+  ungroup()
+#tehty 0, 7, ja 2pv sama käs
+#Combine recepts with visit-data
+final <- cdf1 %>%
+  left_join(best_matches, by = c("FID", "PVM"))
+#1193571rows
+final<-read_parquet(paste0("/media/volume/JaninaH/","2pv_yhdistetyt_reseptit.parquet"))
+
+#-------------week
+one_week <- one_week %>%
+  mutate(
+    FD_HASH = if_else(
+      !is.na(FD_HASH_Rekisterointinumero.x) &
+        FD_HASH_Rekisterointinumero.x != "PUUTTUVA",
+      FD_HASH_Rekisterointinumero.x,
+      FD_HASH_Rekisterointinumero
+    )
+  )
+#--------------day
+same_day <- same_day %>%
+  mutate(
+    FD_HASH = if_else(
+      !is.na(FD_HASH_Rekisterointinumero.y) &
+        FD_HASH_Rekisterointinumero.y != "PUUTTUVA",
+      FD_HASH_Rekisterointinumero.y,
+      FD_HASH_Rekisterointinumero.x
+    )
+  )
+sd <- same_day%>%
+  mutate(
+    Sector = case_when(
+      !is.na(SECTOR) ~ as.numeric(SECTOR),#Käytetään SECTOR-arvoa jos se on olemassa (reseptillisisä käynneissä)
+      grepl("^95|^6", PALTU) ~ 2,#Jos paltu alkaa 95 tai 6 → 2
+      TRUE ~ 1
+    )
+  )
+
+#luetaan toimitusdata
+df_all<-read_parquet(paste0("/media/volume/JaninaH/","fidien_kaikki_toimitukset.parquet"))
+df_all$ab <- ifelse(grepl("^J01", df_all$ATC5_KOODI, ignore.case = TRUE), 1, 0)
+sd<-subset(sd, select = -c(FD_HASH_Rekisterointinumero.x, FD_HASH_Rekisterointinumero.y))
+ct <- sd %>%
+  left_join(df_all, by = c("FID", "PVM"="LAAKEMAARAYS_KIRJOITUS_PV", "ATC_CODE"="ATC5_KOODI"))
+ct <- ct %>%
+  mutate(
+    FD_HASH_Rekisterointinro = if_else(
+      !is.na(FD_HASH) &
+        FD_HASH != "PUUTTUVA",
+      FD_HASH,
+      FD_HASH_Rekisterointinumero
+    )
+  )
+ct<-unique(ct) #1160190 rows
+ct$abp <- ifelse(grepl("^J01", ct$ATC_CODE), 1, 0)
+#add ab column to indicate dispensation
+ct <- ct %>%
+  mutate(ab = if_else(is.na(ab), 0, ab))
+
+dt <- ct %>%
+  mutate(date_only = as.Date(PVM)) %>%
+  arrange(FID, date_only) %>%
+  group_by(FID) %>%
+  mutate(
+    new_period = {
+      period_id <- 0L #alustetaan jaksonumero
+      start_date <- NA #asetetaan ensimmäisen käynnin pvm
+      result <- integer(n()) #luodaan tyhjä result vektori tuloksille ja käydään läpi jokaisen asiakkaan jokainen käynti
+      for (i in seq_along(date_only)) { #jos ei ole vielä aloitettu jaksoa tai nykyinen käynti on yli 30päivää ensimmäisestä
+        if (is.na(start_date) || as.numeric(date_only[i] - start_date) > 30) { #aloitetaan uusi jakso
+          period_id <- period_id + 1L #asetetaan uuden jakson aloituspäivä
+          start_date <- date_only[i]
+        }
+        result[i] <- period_id #tallennetaan jaksonumero riville ja palautetaan vektori sarakkeeksi
+      }
+      result
+    }
+  ) %>%
+  ungroup()
+#calculate visit and episode orders for each fid
+dt <- dt %>%
+  group_by(FID, new_period) %>%
+  mutate(
+    visit_order_in_period = dense_rank(date_only),
+    repeat_count = if_else(
+      visit_order_in_period == 1, #lasketaan toistot vain ekalle riville, toistojen määrä vain uniikkien pvm määrä miinus 1
+      as.integer(n_distinct(date_only) - 1),
+      NA_integer_ #muut rivit saavat arvon NA
+    )
+  ) %>%
+  ungroup()
+#mark is_repetative when visit order other then "1"
+dt$is_repetative <- ifelse(grepl("1", dt$visit_order_in_period), 0, 1)
+
+dt<-dt%>%mutate(ablk = case_when(
+  ATC_CODE %in% c("J01CA04") ~ "Amoxicillin", 
+  ATC_CODE %in% c("J01CR02") ~ "Amoxicillin-clavulanic",
+  grepl("^J01", ATC_CODE, ignore.case = TRUE) & !ATC_CODE %in% c("J01CR02", "J01CA04") ~ "other",
+  TRUE ~ "No ab"
+))
+
+dt <- dt %>%
+  group_by(FID, PVM, Sector, FD_HASH_Rekisterointinro) %>%
+  mutate(has_J01 = any(grepl("^J01", ATC_CODE))) %>%
+  filter(
+    (has_J01 & grepl("^J01", ATC_CODE)) |   # jos ryhmässä J01 → vain J01-rivit
+      (!has_J01 & row_number() == 1)          # jos ei J01 → vain yksi rivi
+  ) %>%
+  ungroup()
+#sectoral----------------------------------------------
+dt <- dt %>%
+  group_by(FID, PVM, Sector) %>%
+  mutate(has_J01 = any(grepl("^J01", ATC_CODE))) %>%
+  filter(
+    (has_J01 & grepl("^J01", ATC_CODE)) |   # jos ryhmässä J01 → vain J01-rivit
+      (!has_J01 & row_number() == 1)          # jos ei J01 → vain yksi rivi
+  ) %>%
+  ungroup()
+#-------------------------------------------------------------
+
+dt <- dt %>%
+  filter(PVM >= as.Date("2017-01-01") & PVM <= as.Date("2022-12-31"))
+
+df <- dt %>%
+  mutate(
+    putkitus = ifelse(grepl("20|1019", TOIMP), 1, 0),  date = as.Date(PVM)
+  ) %>%
+  group_by(FID) %>%
+  mutate(
+    useampi_putkitus = ifelse(sum(putkitus) > 1, 1, 0)
+  ) %>%
+  ungroup()
+df <- df %>% 
+  filter(putkitus==0)
+dt <- df %>%
+  filter(Sector != 3)
+#calculate unique visits (for visit failure) (one row/fid+pvm+sector+fdhash) so that when there is dispensation (ab==1) it comes with, and if not then any ATC_CODE=J01*, if no condition fills then just one row
+uq <-dt %>%
+  group_by(FID, PVM, Sector, FD_HASH_Rekisterointinro) %>%
+  mutate(priority = case_when(
+    ab == 1 ~ 1,
+    grepl("^J01", ATC_CODE) ~ 2,
+    TRUE ~ 3
+  )) %>%
+  slice_min(priority, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(-priority)
+
+uq <- uq %>%
+  arrange(FID, PVM, new_period) %>%
+  group_by(visit_order_in_period) %>%
+  mutate(
+    ab_reps = ab == "1" & is_repetative == "1", #when ab ==1 (dispensed antibiotic)and is_repetative == 1
+    has_ab_after = ab_reps >= 1,
+    failed_visit = if_else(is_repetative == 1 & has_ab_after, 1, 0)
+  ) %>%
+  ungroup() %>%
+  select(-has_ab_after)
+
+#calculate index sector (sector that began the treatment of otitis episode)
+uq <- uq %>%
+  group_by(FID, new_period) %>%
+  mutate(index_sector = Sector[is_repetative == 0][1]) %>%  # haetaan index-visiitin sektori
+  ungroup()
+
+DT <- as.data.table(uq)
+DT[, PVM := as.IDate(PVM)]  # varmistus
+
+DT[, prio := fcase(
+  ablk == "other",                   1L,
+  ablk == "Amoxicillin-clavulanic",  2L,
+  ablk == "Amoxicillin",             3L,
+  default = 99L   # tuntemattomat heikoimmaksi tai käsittele erikseen
+)]
+#---------------------------------------------------------------
+
+df_ws <- DT[
+  , .SD[which.min(prio)],
+  by = .(Sector, FD_HASH_Rekisterointinro, FID, PVM)
+]
+
+
+fids<-unique(df_ws$FID)
+df_ws <- df_ws %>%
+  group_by(FID, new_period) %>%
+  mutate(
+    # Kerää aloituskäyntien sektorit ryhmäkohtaiseksi listaksi
+    start_sectors = list(unique(Sector[is_repetative == 0 & !is.na(Sector)]))
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # Luo index_sector: 0 -> NA, 1 -> se ainoa sektori, >=2 -> "both"
+    index_sector = map_chr(start_sectors, ~ {
+      n <- length(.x)
+      if (n == 0) {
+        NA_character_
+      } else if (n == 1) {
+        as.character(.x[1])
+      } else {
+        "both"
+      }
+    }))
+
+df_expanded <- df_ws %>%
+  mutate(index_sector = case_when(
+    index_sector %in% c("1","2") ~ index_sector,
+    index_sector == "both" ~ "1,2"
+  )) %>%
+  separate_rows(index_sector, sep = ",")
+
+
+failure<-df_expanded %>%group_by(index_sector)%>%
+  summarise(
+    n_total = n(),
+    n_failure = sum(failed_visit == 1, na.rm = TRUE),
+    pct_failure = 100 * n_failure / n_total)
+
+
+ab<-df_ws%>%group_by(Sector)%>%
+  summarise(
+    n_total = n(),
+    n_abp = sum(abp == 1, na.rm = TRUE),
+    pct_abp = 100 * n_abp / n_total)
+index<-df_ws%>%filter(is_repetative==0)
+
+abi<-index%>%group_by(Sector)%>%
+  summarise(
+    n_total = n(),
+    n_abp = sum(abp == 1, na.rm = TRUE),
+    pct_abp = 100 * n_abp / n_total)
+
+abit<-index%>%
+  summarise(
+    n_total = n(),
+    n_abp = sum(abp == 1, na.rm = TRUE),
+    pct_abp = 100 * n_abp / n_total)
+
+abdf<-index%>%
+ filter(abp==1)
+tb<-table(abdf$ablk, abdf$Sector)
+
+wb <- createWorkbook()
+addWorksheet(wb, "failure")
+writeData(wb, "failure", failure)
+
+addWorksheet(wb, "ab_tot1")
+writeData(wb, "ab_tot1", ab)
+
+addWorksheet(wb, "ab_tot_index")
+writeData(wb, "ab_tot_index", abi)
+
+addWorksheet(wb, "ab_y_index")
+writeData(wb, "ab_y_index", abit)
+
+addWorksheet(wb, "ab_luok")
+writeData(wb, "ab_luok", tb)
+
+saveWorkbook(wb, "ikkunat_same_day.xlsx", overwrite = TRUE)
+#------
+#episode intervals, first 14 day, than 45
+ct<-read_parquet(paste0("/media/volume/JaninaH/","toimitukset_datassa.parquet"))
+dt <- ct %>%
+  mutate(date_only = as.Date(PVM)) %>%
+  arrange(FID, date_only) %>%
+  group_by(FID) %>%
+  mutate(
+    new_period = {
+      period_id <- 0L #alustetaan jaksonumero
+      start_date <- NA #asetetaan ensimmäisen käynnin pvm
+      result <- integer(n()) #luodaan tyhjä result vektori tuloksille ja käydään läpi jokaisen asiakkaan jokainen käynti
+      for (i in seq_along(date_only)) { #jos ei ole vielä aloitettu jaksoa tai nykyinen käynti on yli 30päivää ensimmäisestä
+        if (is.na(start_date) || as.numeric(date_only[i] - start_date) > 14) { #aloitetaan uusi jakso
+          period_id <- period_id + 1L #asetetaan uuden jakson aloituspäivä
+          start_date <- date_only[i]
+        }
+        result[i] <- period_id #tallennetaan jaksonumero riville ja palautetaan vektori sarakkeeksi
+      }
+      result
+    }
+  ) %>%
+  ungroup()
+#calculate visit and episode orders for each fid
+dt <- dt %>%
+  group_by(FID, new_period) %>%
+  mutate(
+    visit_order_in_period = dense_rank(date_only),
+    repeat_count = if_else(
+      visit_order_in_period == 1, #lasketaan toistot vain ekalle riville, toistojen määrä vain uniikkien pvm määrä miinus 1
+      as.integer(n_distinct(date_only) - 1),
+      NA_integer_ #muut rivit saavat arvon NA
+    )
+  ) %>%
+  ungroup()
+#mark is_repetative when visit order other then "1"
+dt$is_repetative <- ifelse(grepl("1", dt$visit_order_in_period), 0, 1)
+
+dt<-dt%>%mutate(ablk = case_when(
+  ATC_CODE %in% c("J01CA04") ~ "Amoxicillin", 
+  ATC_CODE %in% c("J01CR02") ~ "Amoxicillin-clavulanic",
+  grepl("^J01", ATC_CODE, ignore.case = TRUE) & !ATC_CODE %in% c("J01CR02", "J01CA04") ~ "other",
+  TRUE ~ "No ab"
+))
+
+dt <- dt %>%
+  group_by(FID, PVM, Sector, FD_HASH_Rekisterointinro) %>%
+  mutate(has_J01 = any(grepl("^J01", ATC_CODE))) %>%
+  filter(
+    (has_J01 & grepl("^J01", ATC_CODE)) |   # jos ryhmässä J01 → vain J01-rivit
+      (!has_J01 & row_number() == 1)          # jos ei J01 → vain yksi rivi
+  ) %>%
+  ungroup()
+#sectoral----------------------------------------------
+dt <- dt %>%
+  group_by(FID, PVM, Sector) %>%
+  mutate(has_J01 = any(grepl("^J01", ATC_CODE))) %>%
+  filter(
+    (has_J01 & grepl("^J01", ATC_CODE)) |   # jos ryhmässä J01 → vain J01-rivit
+      (!has_J01 & row_number() == 1)          # jos ei J01 → vain yksi rivi
+  ) %>%
+  ungroup()
+#-------------------------------------------------------------
+
+dt <- dt %>%
+  filter(PVM >= as.Date("2017-01-01") & PVM <= as.Date("2022-12-31"))
+
+df <- dt %>%
+  mutate(
+    putkitus = ifelse(grepl("20|1019", TOIMP), 1, 0),  date = as.Date(PVM)
+  ) %>%
+  group_by(FID) %>%
+  mutate(
+    useampi_putkitus = ifelse(sum(putkitus) > 1, 1, 0)
+  ) %>%
+  ungroup()
+df <- df %>% 
+  filter(putkitus==0)
+dt <- df %>%
+  filter(Sector != 3)
+#calculate unique visits (for visit failure) (one row/fid+pvm+sector+fdhash) so that when there is dispensation (ab==1) it comes with, and if not then any ATC_CODE=J01*, if no condition fills then just one row
+uq <-dt %>%
+  group_by(FID, PVM, Sector, FD_HASH_Rekisterointinro) %>%
+  mutate(priority = case_when(
+    ab == 1 ~ 1,
+    grepl("^J01", ATC_CODE) ~ 2,
+    TRUE ~ 3
+  )) %>%
+  slice_min(priority, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(-priority)
+
+uq <- uq %>%
+  arrange(FID, PVM, new_period) %>%
+  group_by(visit_order_in_period) %>%
+  mutate(
+    ab_reps = ab == "1" & is_repetative == "1", #when ab ==1 (dispensed antibiotic)and is_repetative == 1
+    has_ab_after = ab_reps >= 1,
+    failed_visit = if_else(is_repetative == 1 & has_ab_after, 1, 0)
+  ) %>%
+  ungroup() %>%
+  select(-has_ab_after)
+
+#calculate index sector (sector that began the treatment of otitis episode)
+uq <- uq %>%
+  group_by(FID, new_period) %>%
+  mutate(index_sector = Sector[is_repetative == 0][1]) %>%  # haetaan index-visiitin sektori
+  ungroup()
+
+df_ws <- uq %>%
+  group_by(FID, new_period) %>%
+  mutate(
+    # Kerää aloituskäyntien sektorit ryhmäkohtaiseksi listaksi
+    start_sectors = list(unique(Sector[is_repetative == 0 & !is.na(Sector)]))
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # Luo index_sector: 0 -> NA, 1 -> se ainoa sektori, >=2 -> "both"
+    index_sector = map_chr(start_sectors, ~ {
+      n <- length(.x)
+      if (n == 0) {
+        NA_character_
+      } else if (n == 1) {
+        as.character(.x[1])
+      } else {
+        "both"
+      }
+    }))
+
+df_expanded <- df_ws %>%
+  mutate(index_sector = case_when(
+    index_sector %in% c("1","2") ~ index_sector,
+    index_sector == "both" ~ "1,2"
+  )) %>%
+  separate_rows(index_sector, sep = ",")
+
+
+failure14<-df_expanded %>%group_by(index_sector)%>%
+  summarise(
+    n_total = n(),
+    n_failure = sum(failed_visit == 1, na.rm = TRUE),
+    pct_failure = 100 * n_failure / n_total)
+
+#------45day
+
+dt <- ct %>%
+  mutate(date_only = as.Date(PVM)) %>%
+  arrange(FID, date_only) %>%
+  group_by(FID) %>%
+  mutate(
+    new_period = {
+      period_id <- 0L #alustetaan jaksonumero
+      start_date <- NA #asetetaan ensimmäisen käynnin pvm
+      result <- integer(n()) #luodaan tyhjä result vektori tuloksille ja käydään läpi jokaisen asiakkaan jokainen käynti
+      for (i in seq_along(date_only)) { #jos ei ole vielä aloitettu jaksoa tai nykyinen käynti on yli 30päivää ensimmäisestä
+        if (is.na(start_date) || as.numeric(date_only[i] - start_date) > 45) { #aloitetaan uusi jakso
+          period_id <- period_id + 1L #asetetaan uuden jakson aloituspäivä
+          start_date <- date_only[i]
+        }
+        result[i] <- period_id #tallennetaan jaksonumero riville ja palautetaan vektori sarakkeeksi
+      }
+      result
+    }
+  ) %>%
+  ungroup()
+#calculate visit and episode orders for each fid
+dt <- dt %>%
+  group_by(FID, new_period) %>%
+  mutate(
+    visit_order_in_period = dense_rank(date_only),
+    repeat_count = if_else(
+      visit_order_in_period == 1, #lasketaan toistot vain ekalle riville, toistojen määrä vain uniikkien pvm määrä miinus 1
+      as.integer(n_distinct(date_only) - 1),
+      NA_integer_ #muut rivit saavat arvon NA
+    )
+  ) %>%
+  ungroup()
+#mark is_repetative when visit order other then "1"
+dt$is_repetative <- ifelse(grepl("1", dt$visit_order_in_period), 0, 1)
+
+dt<-dt%>%mutate(ablk = case_when(
+  ATC_CODE %in% c("J01CA04") ~ "Amoxicillin", 
+  ATC_CODE %in% c("J01CR02") ~ "Amoxicillin-clavulanic",
+  grepl("^J01", ATC_CODE, ignore.case = TRUE) & !ATC_CODE %in% c("J01CR02", "J01CA04") ~ "other",
+  TRUE ~ "No ab"
+))
+
+dt <- dt %>%
+  group_by(FID, PVM, Sector, FD_HASH_Rekisterointinro) %>%
+  mutate(has_J01 = any(grepl("^J01", ATC_CODE))) %>%
+  filter(
+    (has_J01 & grepl("^J01", ATC_CODE)) |   # jos ryhmässä J01 → vain J01-rivit
+      (!has_J01 & row_number() == 1)          # jos ei J01 → vain yksi rivi
+  ) %>%
+  ungroup()
+#sectoral----------------------------------------------
+dt <- dt %>%
+  group_by(FID, PVM, Sector) %>%
+  mutate(has_J01 = any(grepl("^J01", ATC_CODE))) %>%
+  filter(
+    (has_J01 & grepl("^J01", ATC_CODE)) |   # jos ryhmässä J01 → vain J01-rivit
+      (!has_J01 & row_number() == 1)          # jos ei J01 → vain yksi rivi
+  ) %>%
+  ungroup()
+#-------------------------------------------------------------
+
+dt <- dt %>%
+  filter(PVM >= as.Date("2017-01-01") & PVM <= as.Date("2022-12-31"))
+
+df <- dt %>%
+  mutate(
+    putkitus = ifelse(grepl("20|1019", TOIMP), 1, 0),  date = as.Date(PVM)
+  ) %>%
+  group_by(FID) %>%
+  mutate(
+    useampi_putkitus = ifelse(sum(putkitus) > 1, 1, 0)
+  ) %>%
+  ungroup()
+df <- df %>% 
+  filter(putkitus==0)
+dt <- df %>%
+  filter(Sector != 3)
+#calculate unique visits (for visit failure) (one row/fid+pvm+sector+fdhash) so that when there is dispensation (ab==1) it comes with, and if not then any ATC_CODE=J01*, if no condition fills then just one row
+uq <-dt %>%
+  group_by(FID, PVM, Sector, FD_HASH_Rekisterointinro) %>%
+  mutate(priority = case_when(
+    ab == 1 ~ 1,
+    grepl("^J01", ATC_CODE) ~ 2,
+    TRUE ~ 3
+  )) %>%
+  slice_min(priority, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(-priority)
+
+uq <- uq %>%
+  arrange(FID, PVM, new_period) %>%
+  group_by(visit_order_in_period) %>%
+  mutate(
+    ab_reps = ab == "1" & is_repetative == "1", #when ab ==1 (dispensed antibiotic)and is_repetative == 1
+    has_ab_after = ab_reps >= 1,
+    failed_visit = if_else(is_repetative == 1 & has_ab_after, 1, 0)
+  ) %>%
+  ungroup() %>%
+  select(-has_ab_after)
+
+#calculate index sector (sector that began the treatment of otitis episode)
+uq <- uq %>%
+  group_by(FID, new_period) %>%
+  mutate(index_sector = Sector[is_repetative == 0][1]) %>%  # haetaan index-visiitin sektori
+  ungroup()
+
+df_ws <- uq %>%
+  group_by(FID, new_period) %>%
+  mutate(
+    # Kerää aloituskäyntien sektorit ryhmäkohtaiseksi listaksi
+    start_sectors = list(unique(Sector[is_repetative == 0 & !is.na(Sector)]))
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # Luo index_sector: 0 -> NA, 1 -> se ainoa sektori, >=2 -> "both"
+    index_sector = map_chr(start_sectors, ~ {
+      n <- length(.x)
+      if (n == 0) {
+        NA_character_
+      } else if (n == 1) {
+        as.character(.x[1])
+      } else {
+        "both"
+      }
+    }))
+
+df_expanded <- df_ws %>%
+  mutate(index_sector = case_when(
+    index_sector %in% c("1","2") ~ index_sector,
+    index_sector == "both" ~ "1,2"
+  )) %>%
+  separate_rows(index_sector, sep = ",")
+
+
+failure45<-df_expanded %>%group_by(index_sector)%>%
+  summarise(
+    n_total = n(),
+    n_failure = sum(failed_visit == 1, na.rm = TRUE),
+    pct_failure = 100 * n_failure / n_total)
+
+
+wb <- createWorkbook()
+addWorksheet(wb, "failure14")
+writeData(wb, "failure14", failure14)
+
+addWorksheet(wb, "failure45")
+writeData(wb, "failure45", failure45)
+
+
+saveWorkbook(wb, "ikkunat_episode.xlsx", overwrite = TRUE)
