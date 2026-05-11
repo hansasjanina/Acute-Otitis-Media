@@ -1,0 +1,160 @@
+## ============================================================================
+## SECTION 4: Tympanostomy Tube Procedures (HILMO)
+##            Procedure code: DCA20 (ventilation tube insertion)
+## ============================================================================
+
+# --- 4.1 Read and filter HILMO procedure files for DCA20 ---------------------
+
+ht1 <- fread("/media/volume/Data_20260319//THL//FD_2698_THL2023_2698_H_TOIMENP_1.csv")
+filtered_1 <- subset(ht1, grepl("DCA20", TOIMP, ignore.case = TRUE))
+
+ht2 <- fread("/media/volume/Data_20260319//THL//FD_2698_THL2023_2698_H_TOIMENP_2.csv")
+filtered_2 <- subset(ht2, grepl("DCA20", TOIMP, ignore.case = TRUE))
+
+ht3 <- fread("/media/volume/Data_20260319//THL//FD_2698_THL2023_2698_H_TOIMENP_3.csv")
+filtered_3 <- subset(ht3, grepl("DCA20", TOIMP, ignore.case = TRUE))
+
+ht4 <- fread("/media/volume/Data_20260319//THL//FD_2698_THL2023_2698_H_TOIMENP_4.csv")
+filtered_4 <- subset(ht4, grepl("DCA20", TOIMP, ignore.case = TRUE))
+
+ht5 <- fread("/media/volume/Data_20260319//THL//FD_2698_THL2023_2698_H_TOIMENP_5.csv")
+filtered_5 <- subset(ht5, grepl("DCA20", TOIMP, ignore.case = TRUE))
+
+# Combine all DCA20 procedure records
+toimenpiteet <- bind_rows(filtered_1, filtered_2, filtered_3, filtered_4, filtered_5)
+toimenpiteet %>% write_parquet(paste0("/media/volume/JaninaH/", "hilmo_putkitukset"))
+toimenpiteet <- read_parquet(paste0("/media/volume/JaninaH/", "hilmo_putkitukset"))
+
+
+# --- 4.2 Link procedure records with visit data and apply age/date filters ---
+
+# Combine all HILMO visit files; ensure HILMOID types match for joining
+id <- unique(toimenpiteet$HILMOID)
+hi <- bind_rows(h0712, h1317, h1820, h2122, h9806)
+hi$HILMOID           <- as.character(hi$HILMOID)
+toimenpiteet$HILMOID <- as.character(toimenpiteet$HILMOID)
+
+# Merge procedure data with visit data on patient and visit IDs
+hilto <- left_join(toimenpiteet, hi, by = c("FID" = "FID", "HILMOID" = "HILMOID"))
+
+# Merge with demographics
+hilto <- left_join(hilto, df, by = "FID")
+
+# Convert procedure date and calculate age at procedure
+hilto$PVM <- as.Date(as.character(hilto$TUPVA), format = "%d.%m.%Y")  # n = 264,903
+hilto$Ika <- as.numeric(difftime(hilto$PVM, hilto$Syntymapaiva, units = "days")) / 365.25
+
+# Restrict to children under 18 years
+hilt <- subset(hilto, Ika < 18)  # n = 245,587
+
+# Apply study period filter (2017–2022)
+hilto <- hilt %>%
+  filter(PVM >= as.Date("2017-01-01") & PVM <= as.Date("2022-12-31"))  # n = 21,113
+
+
+# --- 4.3 Integrate procedure data into HILMO diagnosis dataset and
+#         resolve missing procedures -------------------------------------------
+
+# Restrict HILMO diagnosis data to study period and merge with procedure codes
+hilmot <- left_join(hilmot, toimenpiteet,
+                    by = c("FID" = "FID", "HILMOID" = "HILMOID"))
+hilmot <- hilmot %>%
+  filter(TUPVA >= as.Date("2017-01-01") & TUPVA <= as.Date("2022-12-31"))
+# n = 298,741 total rows; 20,788 with procedure codes
+
+# Identify procedure records missing from the diagnosis dataset
+puuttuvat <- anti_join(hilto, hilmot, by = c("FID", "HILMOID"))
+puuttuvat$TUPVA <- as.Date(as.character(puuttuvat$TUPVA), format = "%d.%m.%Y")
+
+# Add missing procedure rows and remove duplicates
+hilmot <- bind_rows(hilmot, puuttuvat)
+hilmot <- unique(hilmot)
+
+table(hilmot$TOIMP)
+
+# Remove duplicate procedures per patient, date, and procedure code
+hilmot <- hilmot %>%
+  distinct(TUPVA, FID, TOIMP, .keep_all = TRUE)  # n = 20,631 procedures retained
+
+sum(is.na(hilmot$KOODI))  # 1,564 rows without ICD-10 code (from procedure-only records)
+
+# Save HILMO dataset with procedures
+hilmot %>% write_parquet(paste0("/media/volume/JaninaH/", "hilmo_myos_tp.parquet"))
+hilmot <- read_parquet("/media/volume/JaninaH/hilmo_myos_tp.parquet")
+
+
+## ============================================================================
+## SECTION 5: Tympanostomy Tube Procedures (AvoHILMO)
+##            Procedure codes: DCA20 and SPAT1019
+## ============================================================================
+
+# --- 5.1 Read and filter AvoHILMO procedure files for DCA20 or SPAT1019 -----
+
+aht1 <- fread("/media/volume/Data_20260319//THL//FD_2698_THL2023_2698_AH_TOIMENPITEET_1.csv")
+filtered_1 <- subset(aht1, grepl("DCA20|1019", TOIMENPIDE, ignore.case = TRUE))
+
+aht2 <- fread("/media/volume/Data_20260319//THL//FD_2698_THL2023_2698_AH_TOIMENPITEET_2.csv")
+filtered_2 <- subset(aht2, grepl("DCA20|1019", TOIMENPIDE, ignore.case = TRUE))
+
+aht3 <- fread("/media/volume/Data_20260319//THL//FD_2698_THL2023_2698_AH_TOIMENPITEET_3.csv")
+filtered_3 <- subset(aht3, grepl("DCA20|1019", TOIMENPIDE, ignore.case = TRUE))
+
+aht4 <- fread("/media/volume/Data_20260319//THL//FD_2698_THL2023_2698_AH_TOIMENPITEET_4.csv")
+filtered_4 <- subset(aht4, grepl("DCA20|1019", TOIMENPIDE, ignore.case = TRUE))
+
+# Combine all AvoHILMO procedure records
+toimenpiteet <- bind_rows(filtered_1, filtered_2, filtered_3, filtered_4)
+toimenpiteet$AVOHILMOID <- as.character(toimenpiteet$AVOHILMOID)
+
+toimenpiteet %>% write_parquet(paste0("/media/volume/JaninaH/", "avohilmo_putkitukset"))
+toimenpiteet <- read_parquet(paste0("/media/volume/JaninaH/", "avohilmo_putkitukset"))
+
+# Merge AvoHILMO diagnosis data with procedure data on patient and visit IDs
+ahs <- left_join(avot, toimenpiteet,
+                 by = c("FID" = "FID", "AVOHILMOID" = "AVOHILMOID"))
+table(ahs$TOIMENPIDE)
+
+
+## ============================================================================
+## SECTION 6: Combine HILMO and AvoHILMO Data
+## ============================================================================
+
+# Mark data source (AH = AvoHILMO primary care; H = HILMO specialised care)
+ahs$PALVELUNTUOTTAJA <- as.character(ahs$PALVELUNTUOTTAJA)
+ahs["data"]    <- "AH"
+hilmot["data"] <- "H"
+
+ahs %>% write_parquet(paste0("/media/volume/JaninaH/", "avohilmo_myos_tp.parquet"))
+ahs <- read_parquet(paste0("/media/volume/JaninaH/", "avohilmo_myos_tp.parquet"))
+
+# Harmonise column names across AvoHILMO and HILMO for combining
+colnames(ahs)[3]  <- "PALTU"          # Service provider
+colnames(ahs)[4]  <- "PVM"            # Visit date
+colnames(ahs)[1]  <- "AVOTAIHILMOID"  # Visit ID (AvoHILMO or HILMO)
+colnames(ahs)[12] <- "TOIMP"          # Procedure code
+colnames(ahs)[7]  <- "Syntymapaiva"   # Date of birth
+colnames(ahs)[9]  <- "kieli"          # Native language
+ahs <- subset(ahs, select = -c(11))   # Remove redundant column
+
+colnames(hilmot)[4] <- "PVM"
+colnames(hilmot)[3] <- "FID"
+colnames(hilmot)[1] <- "AVOTAIHILMOID"
+hilmot <- subset(hilmot, select = -c(3, 13, 14, 16))
+colnames(hilmot)[9] <- "kieli"
+
+# Restrict AvoHILMO data to study period (2017–2022)
+ahs <- ahs %>%
+  filter(PVM >= as.Date("2017-01-01") & PVM <= as.Date("2022-12-31"))
+
+# Remove duplicate visits: same date, patient, procedure code, and diagnosis
+ahs <- ahs %>%
+  distinct(PVM, FID, TOIMP, KOODI, .keep_all = TRUE)
+
+sum(is.na(ahs$KOODI))
+
+# Combine HILMO and AvoHILMO into a single dataset
+avoh <- bind_rows(hilmot, ahs)
+avoh %>% write_parquet(paste0("/media/volume/JaninaH/", "avojahilmo_tp.parquet"))
+cdf1 <- read_parquet(paste0("/media/volume/JaninaH/", "avojahilmo_tp.parquet"))
+
+
